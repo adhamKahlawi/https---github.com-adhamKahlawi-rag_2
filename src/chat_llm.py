@@ -17,76 +17,13 @@ import os
 import json
 from difflib import SequenceMatcher
 from typing import List, Tuple
+from src.prompts import INTENT_SYSTEM, QA_SYSTEM, QA_CITATION_SYSTEM, SUMMARY_SYSTEM,MANUAL_SYSTEM
 
 import litellm
 import vertexai
 from langchain_google_vertexai import VertexAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-
-
-# ── Prompts ────────────────────────────────────────────────────────────────────
-
-INTENT_SYSTEM = """You are an intent classifier. Given a user query, decide whether
-the user wants:
-  A) A SUMMARY of an entire document (they mention a document/book title or ask for
-     a summary/overview/riassunto/sommario), OR
-  B) A specific QA answer to a factual question.
-
-Reply with exactly one word: SUMMARY or QA."""
-
-QA_SYSTEM = """You are a precise Information Retrieval Assistant.
-Language rule: always answer in Italian, regardless of the query language.
-
-The context below contains paragraphs each ending with a citation:
-  [Book Title | Chapter Title | Page Range]
-
-Rules:
-- Answer ONLY from the provided context. No external knowledge.
-- At the end list every citation that contributed ≥20 % of your answer.
-- If the answer is not in the context, say so in Italian.
-
-Format:
-<answer text>
-
-Fonti:
-[Citation 1]
-[Citation 2]   ← only if applicable
-
-Context:
-{context}"""
-
-QA_CITATION_SYSTEM = """You are a precise Information Retrieval Assistant.
-Language rule: always answer in Italian, regardless of the query language.
-
-The context contains paragraphs each ending with a citation:
-  [Book Title | Chapter Title | Page Range]
-
-Rules:
-- Answer ONLY from the provided context. No external knowledge.
-- Include EVERY distinct citation that appears in the context (de-duplicated).
-- If the answer is not in the context, say so in Italian.
-
-Format:
-<answer text>
-
-Fonti:
-[Citation 1]
-[Citation 2]   ← only if applicable
-
-Context:
-{context}"""
-
-SUMMARY_SYSTEM = """You are a Document Summarisation Expert.
-Language rule: always write in Italian.
-
-You are given all the chunks from a specific document.
-Write a comprehensive, well-structured summary organised by chapter/section.
-End with a brief list of key takeaways.
-
-Context:
-{context}"""
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -118,8 +55,8 @@ class GeminiRAGSystem:
         self,
         project_id: str,
         index_path: str = "vector_database",
-        chat_model: str = "vertex_ai/gemini-2.5-flash-preview-04-17",
-        intent_model: str = "vertex_ai/gemini-2.0-flash-001",
+        chat_model: str = "vertex_ai/gemini-2.0-flash",
+        intent_model: str = "vertex_ai/gemini-2.0-flash",
         memory_k: int = 10,
         metadata_json: str = "vector_database/doc_metadata.json",
     ):
@@ -155,23 +92,34 @@ class GeminiRAGSystem:
         )
 
         # Load document titles from metadata for summary matching
-        self._doc_titles: List[Tuple[str, str]] = []  # [(title, source), ...]
+        self._doc_titles: List = []  
         if os.path.exists(metadata_json):
             with open(metadata_json, "r", encoding="utf-8") as fh:
                 meta = json.load(fh)
             for v in meta.values():
                 title = v.get("title", "") 
-                source = v.get("source", "general")
                 if title:
-                    self._doc_titles.append((title, source))
+                    self._doc_titles.append(title)
 
     # ------------------------------------------------------------------
     # Intent detection
     # ------------------------------------------------------------------
 
     def _detect_intent(self, query: str) -> str:
-        """Returns 'SUMMARY' or 'QA'."""
+        """Returns 'SUMMARY', 'INFORMATION', 'MANUAL' or 'QA'."""
         try:
+            response_schema = {
+                "type": "object",
+                "properties": {
+                    "Categories": {
+                        "type": "string",
+                        "enum": ["SUMMARY", "QA", "MANUAL", "INFORMATION"],
+                        "description": "The classified intent category of the user query."
+                    }
+                },
+                "required": ["Categories"],
+                "additionalProperties": False
+            }
             resp = litellm.completion(
                 model=self.intent_model,
                 messages=[
@@ -180,10 +128,46 @@ class GeminiRAGSystem:
                 ],
                 temperature=0.0,
                 max_tokens=10,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "query_category", # Fixed typo in name
+                        "strict": True,
+                        "schema": response_schema
+                    }
+                },
             )
-            intent = resp.choices[0].message.content.strip().upper()
-            return "SUMMARY" if "SUMMARY" in intent else "QA"
-        except Exception:
+            intent_str = resp.choices[0].message.content.strip()
+            
+            # 1. Try to parse as JSON first
+            try:
+                # Use json.loads() for strings
+                data = json.loads(intent_str)
+                # Check for variations in case just to be safe
+                cat = data.get("Categories") or data.get("categories") or data.get("CATEGORIES")
+                
+                if cat and cat.upper() in ["SUMMARY", "QA", "MANUAL", "INFORMATION"]:
+                    return cat.upper()
+            except json.JSONDecodeError:
+                # If JSON parsing fails, we'll gracefully fall down to the string-matching logic
+                pass 
+            
+            # 2. Fallback: robust string matching if JSON is malformed
+            intent_lower = intent_str.lower()
+            for word in ["SUMMARY", "QA", "MANUAL", "INFORMATION"]:
+                if word.lower() in intent_lower:
+                    return word
+            
+            # 3. Ultimate safe default if nothing matches
+            print("###################")
+            print(f"Fallback triggered. Unmatched intent string: {intent_str}")
+            print("###################")
+            return "QA"
+            
+        except Exception as e:
+            print("###################")
+            print(f"Fatal error in intent detection: {e}")
+            print("###################")
             return "QA"  # safe default
 
     # ------------------------------------------------------------------
@@ -206,10 +190,10 @@ class GeminiRAGSystem:
     # Retrieval helpers
     # ------------------------------------------------------------------
 
-    def _qa_retrieval(self, query: str, source: str, k: int = 16) -> List[Document]:
+    def _qa_retrieval(self, query: str, source: str="general", k: int = 16) -> List[Document]:
         kwargs: dict = {"k": k}
-        if source != "general":
-            kwargs["filter"] = {"source": source}
+        #if source != "general":
+        kwargs["filter"] = {"source": source}
         return self.vector_db.similarity_search(query, **kwargs)
 
     def _summary_retrieval(self, query: str) -> Tuple[List[Document], str]:
@@ -223,18 +207,18 @@ class GeminiRAGSystem:
             return self.vector_db.similarity_search(query, k=50), "unknown"
 
         # Score each known title against the query
-        best_title, best_source, best_score = "", "general", 0.0
-        for title, source in self._doc_titles:
+        best_title, best_source, best_score = "", "citazione", 0.0
+        for title in self._doc_titles:
             score = _similarity(query, title)
             if score > best_score:
-                best_score, best_title, best_source = score, title, source
+                best_score, best_title = score, title
 
         # Fetch ALL chunks with that title (FAISS doesn't support "get all by
         # filter" natively, so we use a large-k similarity search + filter)
         docs = self.vector_db.similarity_search(
             best_title,
             k=500,
-            filter={"title": best_title},
+            filter={"title": best_title, "source": best_source},
         )
 
         # De-duplicate by page_content
@@ -291,6 +275,11 @@ class GeminiRAGSystem:
 
         if intent == "SUMMARY":
             docs, matched_title = self._summary_retrieval(query)
+            print("#######################")
+            print("A")
+            print(len(docs))
+            print("#######################")
+
             if not docs:
                 answer = (
                     "Non ho trovato un documento corrispondente al titolo indicato."
@@ -299,16 +288,50 @@ class GeminiRAGSystem:
                 context = _format_context(docs)
                 system = SUMMARY_SYSTEM.format(context=context)
                 answer = self._llm(system, f"Riassumi il documento: {matched_title}")
-
-        else:  # QA
-            docs = self._qa_retrieval(query, source, k=k)
+        elif intent == "INFORMATION": 
+            docs = self._qa_retrieval(query, source = "citazione", k=k)
+            print("#######################")
+            print("B")
+            print(len(docs))
+            print("#######################")
             if not docs:
                 return (
                     "Le risorse attualmente disponibili non forniscono una risposta "
                     "definitiva alla Sua domanda."
                 )
             context = _format_context(docs)
-            template = QA_CITATION_SYSTEM if source == "citazione" else QA_SYSTEM
+            template = QA_CITATION_SYSTEM #if source == "citazione" else QA_SYSTEM
+            system = template.format(context=context)
+            answer = self._llm(system, query)
+        elif intent == "MANUAL": 
+            docs = self._qa_retrieval(query, source = "manuale", k=100)
+            print("#######################")
+            print("C")
+            print(len(docs))
+            print("#######################")
+            if not docs:
+                return (
+                    "Le risorse attualmente disponibili non forniscono una risposta "
+                    "definitiva alla Sua domanda."
+                )
+            context = _format_context(docs)
+            print(context)
+            template = MANUAL_SYSTEM #if source == "citazione" else QA_SYSTEM
+            system = template.format(context=context)
+            answer = self._llm(system, query)
+        else:  # QA
+            docs = self._qa_retrieval(query, source, k=k)
+            print("#######################")
+            print("D")
+            print(len(docs))
+            print("#######################")
+            if not docs:
+                return (
+                    "Le risorse attualmente disponibili non forniscono una risposta "
+                    "definitiva alla Sua domanda."
+                )
+            context = _format_context(docs)
+            template = QA_SYSTEM #QA_CITATION_SYSTEM if source == "citazione" else QA_SYSTEM
             system = template.format(context=context)
             answer = self._llm(system, query)
 

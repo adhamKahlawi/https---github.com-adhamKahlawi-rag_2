@@ -30,12 +30,6 @@ with gr.Blocks(title="RAG Assistant") as demo:
     gr.Markdown(
         """
         ### Benvenuto nel RAG Assistant
-        **Modalità disponibili**
-        | Prefisso | Fonte |
-        |---|---|
-        | *(nessuno)* | Dispensa (generale) |
-        | `citazione` | Solo documenti di tipo *citazione* |
-        | `manuale` | Solo documenti di tipo *manuale* |
 
         Il sistema rileva automaticamente se vuoi una **risposta puntuale** (QA)
         o un **riassunto** di un documento (basta includere il titolo nella domanda).
@@ -46,7 +40,7 @@ with gr.Blocks(title="RAG Assistant") as demo:
 
     msg = gr.Textbox(
         label="La tua domanda",
-        placeholder="es. 'manuale: come si configura X?' oppure 'Riassumi INTRODUZIONE A FAIR'",
+        placeholder="es. 'come si configura X?' oppure 'Riassumi INTRODUZIONE A FAIR'",
         lines=2,
     )
 

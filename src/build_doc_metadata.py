@@ -38,7 +38,28 @@ def _is_toc_page(text: str) -> bool:
     total_lines = max(text.count("\n"), 1)
     return len(matches) / total_lines > 0.25   # >25% of lines look like TOC entries
 
-
+response_schema = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "pages": {"type": "integer"},
+        "chapters": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "chapter_name": {"type": "string"},
+                    "start_page": {"type": "integer"},
+                    "end_page": {"type": "integer"}
+                },
+                "required": ["chapter_name", "start_page", "end_page"],
+                "additionalProperties": False # Recommended for strictness
+            }
+        }
+    },
+    "required": ["title", "pages", "chapters"],
+    "additionalProperties": False
+}
 EXTRACTION_PROMPT = """
 Act as a Document Analysis Expert. Analyse the provided document and extract its
 structural metadata as valid JSON.
@@ -234,7 +255,14 @@ class MetadataGenerator:
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            response_format={"type": "json_object"},
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "book_summary", # A unique name is required by some providers
+                    "strict": True,          # Forces the model to follow the schema exactly
+                    "schema": response_schema
+                }
+            },
         )
         raw = response.choices[0].message.content
         print(f"  [llm] {raw[:300]}")
