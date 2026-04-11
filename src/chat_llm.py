@@ -160,7 +160,7 @@ class GeminiRAGSystem:
             with open(metadata_json, "r", encoding="utf-8") as fh:
                 meta = json.load(fh)
             for v in meta.values():
-                title = v.get("title", "")
+                title = v.get("title", "") 
                 source = v.get("source", "general")
                 if title:
                     self._doc_titles.append((title, source))
