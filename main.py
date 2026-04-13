@@ -36,7 +36,7 @@ with gr.Blocks(title="RAG Assistant") as demo:
         """
     )
 
-    chatbot = gr.Chatbot(label="Conversazione", type="messages", height=500)
+    chatbot = gr.Chatbot(label="Conversazione", height=500) #, type="messages"
 
     msg = gr.Textbox(
         label="La tua domanda",

@@ -21,7 +21,7 @@ from src.prompts import INTENT_SYSTEM, QA_SYSTEM, QA_CITATION_SYSTEM, SUMMARY_SY
 
 import litellm
 import vertexai
-from langchain_google_vertexai import VertexAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 
@@ -81,8 +81,8 @@ class GeminiRAGSystem:
         self._history: list = []          # rolling list of {role, content} dicts
 
         # Load FAISS
-        embeddings = VertexAIEmbeddings(
-            model_name="text-embedding-004",
+        embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/text-embedding-004",
             project=project_id,
         )
         if not os.path.exists(index_path):
