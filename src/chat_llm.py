@@ -106,14 +106,14 @@ class GeminiRAGSystem:
     # ------------------------------------------------------------------
 
     def _detect_intent(self, query: str) -> str:
-        """Returns 'SUMMARY', 'INFORMATION', 'MANUAL' or 'QA'."""
+        """Returns 'SUMMARY', 'INFORMATION', 'MANUAL', LLM, or 'QA'."""
         try:
             response_schema = {
                 "type": "object",
                 "properties": {
                     "Categories": {
                         "type": "string",
-                        "enum": ["SUMMARY", "QA", "MANUAL", "INFORMATION"],
+                        "enum": ["SUMMARY", "QA", "MANUAL", "INFORMATION","LLM"],
                         "description": "The classified intent category of the user query."
                     }
                 },
@@ -154,7 +154,7 @@ class GeminiRAGSystem:
             
             # 2. Fallback: robust string matching if JSON is malformed
             intent_lower = intent_str.lower()
-            for word in ["SUMMARY", "QA", "MANUAL", "INFORMATION"]:
+            for word in ["SUMMARY", "QA", "MANUAL", "INFORMATION", "LLM"]:
                 if word.lower() in intent_lower:
                     return word
             
@@ -275,10 +275,6 @@ class GeminiRAGSystem:
 
         if intent == "SUMMARY":
             docs, matched_title = self._summary_retrieval(query)
-            print("#######################")
-            print("A")
-            print(len(docs))
-            print("#######################")
 
             if not docs:
                 answer = (
@@ -290,10 +286,6 @@ class GeminiRAGSystem:
                 answer = self._llm(system, f"Riassumi il documento: {matched_title}")
         elif intent == "INFORMATION": 
             docs = self._qa_retrieval(query, source = "citazione", k=k)
-            print("#######################")
-            print("B")
-            print(len(docs))
-            print("#######################")
             if not docs:
                 return (
                     "Le risorse attualmente disponibili non forniscono una risposta "
@@ -305,10 +297,6 @@ class GeminiRAGSystem:
             answer = self._llm(system, query)
         elif intent == "MANUAL": 
             docs = self._qa_retrieval(query, source = "manuale", k=100)
-            print("#######################")
-            print("C")
-            print(len(docs))
-            print("#######################")
             if not docs:
                 return (
                     "Le risorse attualmente disponibili non forniscono una risposta "
@@ -319,12 +307,34 @@ class GeminiRAGSystem:
             template = MANUAL_SYSTEM #if source == "citazione" else QA_SYSTEM
             system = template.format(context=context)
             answer = self._llm(system, query)
+        elif intent == "LLM":
+            # ── Direct LLM answer (no retrieval) ──────────────────────────
+            try:
+                resp = litellm.completion(
+                    model=self.chat_model,
+                    messages=_build_messages(
+                        "Sei un assistente esperto. Rispondi in modo chiaro e preciso. "
+                        "Alla fine della risposta, cita sempre le fonti utilizzate "
+                        "(modello, data di addestramento o conoscenza generale).",
+                        self._history,
+                        query,
+                    ),
+                    temperature=0.0,
+                    max_tokens=2048,
+                )
+                raw_answer = resp.choices[0].message.content.strip()
+            except Exception as e:
+                raw_answer = f"Errore durante la generazione della risposta: {e}"
+
+            answer = (
+                f"{raw_answer}\n\n"
+                "---\n"
+                "⚠️ *Nota: la risposta è stata generata direttamente dal LLM "
+                "senza consultare la base documentale.*"
+            )
+
         else:  # QA
             docs = self._qa_retrieval(query, source, k=k)
-            print("#######################")
-            print("D")
-            print(len(docs))
-            print("#######################")
             if not docs:
                 return (
                     "Le risorse attualmente disponibili non forniscono una risposta "
@@ -334,6 +344,5 @@ class GeminiRAGSystem:
             template = QA_SYSTEM #QA_CITATION_SYSTEM if source == "citazione" else QA_SYSTEM
             system = template.format(context=context)
             answer = self._llm(system, query)
-
         self._update_memory(query, answer)
         return answer

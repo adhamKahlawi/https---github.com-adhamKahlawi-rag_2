@@ -17,6 +17,8 @@ from langchain_community.document_loaders import (
     TextLoader,
     UnstructuredPDFLoader,
 )
+import pymupdf4llm  # pip install pymupdf4llm
+import pdfplumber  # pip install pdfplumber
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
@@ -49,8 +51,6 @@ class VectorDBBuilder:
 
         # ── Tier 1: pymupdf4llm ──────────────────────────────────────────
         try:
-            import pymupdf4llm  # pip install pymupdf4llm
-
             md_pages: list[str] = pymupdf4llm.to_markdown(
                 file_path, 
                 pages=None,          # all pages
@@ -75,7 +75,6 @@ class VectorDBBuilder:
 
         # ── Tier 2: pdfplumber – extract text + repair tables ────────────
         try:
-            import pdfplumber  # pip install pdfplumber
 
             docs = []
             with pdfplumber.open(file_path) as pdf:
