@@ -163,6 +163,7 @@ class VectorDBBuilder:
 
     def _load_pages(self, file_path: str) -> List[Document]:
         ext = self._ext(file_path)
+        print(file_path)
         if ext == "pdf":
             return self._load_pdf_pages(file_path)
         if ext == "docx":
@@ -193,6 +194,7 @@ class VectorDBBuilder:
         chunks: List[Document] = []
 
         for file_path, structure in metadata.items():
+            print("kahlawi")
             pages = self._load_pages(file_path)
             if not pages:
                 continue

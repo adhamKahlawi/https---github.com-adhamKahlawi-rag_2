@@ -334,6 +334,7 @@ class GeminiRAGSystem:
             )
 
         else:  # QA
+            # from the dispensa
             docs = self._qa_retrieval(query, source, k=k)
             if not docs:
                 return (
@@ -343,6 +344,19 @@ class GeminiRAGSystem:
             context = _format_context(docs)
             template = QA_SYSTEM #QA_CITATION_SYSTEM if source == "citazione" else QA_SYSTEM
             system = template.format(context=context)
-            answer = self._llm(system, query)
+            answer_1 = self._llm(system, query)
+            # from citation
+            docs = self._qa_retrieval(query, source = "citazione", k=k)
+            if not docs:
+                answer_2 = None
+            else:
+                context = _format_context(docs)
+                template = QA_CITATION_SYSTEM #if source == "citazione" else QA_SYSTEM
+                system = template.format(context=context)
+                answer_2 = self._llm(system, query)
+            if answer_2 == None:
+                answer = answer_1
+            else:
+                answer = answer_1 + "\n" + answer_2
         self._update_memory(query, answer)
         return answer
