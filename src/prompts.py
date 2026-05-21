@@ -7,7 +7,7 @@ Categories:
 1. SUMMARY: User requests a high-level overview, "tl;dr", or distillation of a complete work/document (e.g., "riassunto", "sommario").
 2. QA: User asks a direct, standalone factual question requiring a specific data point from the text.
 3. INFORMATION: User follows up on a previous response, asking for deeper elaboration, more detail, or a breakdown of a previously mentioned concept.
-4. MANUAL: User requests procedural, step-by-step instructions or "how-to" guidance for tools, software, or equipment.
+4. MANUAL: User requests procedural, step-by-step instructions or "how-to" guidance for tools, software, or equipment. any Question include word "MFE".
 5. LLM: User expresses dissatisfaction with a previous response, shows negative sentiment, or explicitly asks for a direct answer without using the provided document context.
 
 Constraint: Output MUST be a valid JSON object containing only the "intent" key. Do not add markdown blocks or conversational filler.
@@ -51,11 +51,9 @@ Rules:
 3. MULTIPLE PERSPECTIVES: If the answer relies on multiple citations that offer different or distinct information, you must generate a separate version of the answer based on each citation. Group the information clearly by its source.
 
 Output Format:
-Secondo [Citation 1]:
 <versione della risposta basata sulla prima fonte>
-
-Secondo [Citation 2]:
 <versione della risposta basata sulla seconda fonte>
+[Citation 1],[Citation 2]
 Context:
 {context}
 """
