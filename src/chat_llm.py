@@ -1,54 +1,108 @@
 """
 chat_llm.py
-RAG chat engine backed by LiteLLM (swap model with one env-var change).
-
-Key improvements vs original
-─────────────────────────────
-1. LiteLLM replaces the direct Vertex AI SDK calls.
-2. Intent detection: classifies the query as QA or SUMMARY before retrieval.
-3. Summary path: fetches ALL chunks whose `title` matches the requested document
-   instead of top-k similarity results.
-4. QA path: standard top-k similarity search (with optional source filter).
-5. Conversation memory maintained with a simple rolling list (no langchain dep).
-6. Cleaner prompt templates with explicit language instruction.
+RAG chat engine backed by LiteLLM.
 """
 
-import os
 import json
+import os
+import re
 from difflib import SequenceMatcher
-from typing import List, Tuple
-from src.prompts import INTENT_SYSTEM, QA_SYSTEM, QA_CITATION_SYSTEM, SUMMARY_SYSTEM,MANUAL_SYSTEM
+from typing import Dict, List, Optional, Tuple
 
 import litellm
 import vertexai
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+from src.prompts import (
+    DIRECT_LLM_SYSTEM,
+    INTENT_SYSTEM,
+    MANUAL_SYSTEM,
+    QA_CITATION_SYSTEM,
+    QA_SYSTEM,
+    QUERY_REWRITE_SYSTEM,
+    SUMMARY_SYSTEM,
+)
+
+
+INTENTS = {"SUMMARY", "QA", "MANUAL", "INFORMATION", "LLM"}
+SUMMARY_MATCH_THRESHOLD = 0.45
+YES_VALUES = {"si", "s\u00ec", "yes", "y", "ok", "certo", "confermo"}
+NO_VALUES = {"no", "n", "nope", "annulla", "non usare", "senza manuale"}
+NO_SOURCE_ANSWER = (
+    "Le risorse attualmente disponibili non forniscono una risposta definitiva alla Sua domanda.\n\n"
+    "[Fonti: nessuna fonte pertinente]"
+)
+
+
+def _normalize_for_embedding(text: str) -> str:
+    """Normalize text immediately before embedding lookup."""
+    return (text or "").strip().lower()
+
+
+def _tokenize(text: str) -> List[str]:
+    return re.findall(r"[\w']+", text.lower())
+
 
 def _similarity(a: str, b: str) -> float:
-    """Simple fuzzy similarity between two strings (0–1)."""
+    """Simple fuzzy similarity between two strings (0-1)."""
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+def _token_set_similarity(a: str, b: str) -> float:
+    a_tokens = set(_tokenize(a))
+    b_tokens = set(_tokenize(b))
+    if not a_tokens or not b_tokens:
+        return 0.0
+    overlap = len(a_tokens & b_tokens)
+    precision = overlap / len(a_tokens)
+    recall = overlap / len(b_tokens)
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def _title_match_score(query: str, title: str) -> float:
+    query_l = query.lower()
+    title_l = title.lower()
+    containment = 1.0 if title_l in query_l or query_l in title_l else 0.0
+    return max(_similarity(query_l, title_l), _token_set_similarity(query_l, title_l), containment)
 
 
 def _format_context(docs: List[Document]) -> str:
     parts = []
     for doc in docs:
         m = doc.metadata
-        citation = f"[{m.get('title', '')}|{m.get('chapter', '')}|{m.get('page_range', '')}]"
+        citation = f"[{m.get('title', '')} | {m.get('chapter', '')} | {m.get('page_range', '')}]"
         parts.append(f"{doc.page_content} {citation}.")
     return "\n---\n".join(parts)
 
 
-def _build_messages(system: str, history: list, user_query: str) -> list:
+def _build_messages(system: str, history: list, user_query: str, include_history: bool = True) -> list:
     messages = [{"role": "system", "content": system}]
-    messages.extend(history)
+    if include_history:
+        messages.extend(history)
     messages.append({"role": "user", "content": user_query})
     return messages
 
 
-# ── Main class ─────────────────────────────────────────────────────────────────
+def _dedupe(items: List[str], limit: Optional[int] = None) -> List[str]:
+    seen = set()
+    deduped = []
+    for item in items:
+        normalized = re.sub(r"\s+", " ", item).strip(" []\t\r\n,.;")
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+        if limit and len(deduped) >= limit:
+            break
+    return deduped
+
 
 class GeminiRAGSystem:
     def __init__(
@@ -60,27 +114,16 @@ class GeminiRAGSystem:
         memory_k: int = 10,
         metadata_json: str = "vector_database/doc_metadata.json",
     ):
-        """
-        Parameters
-        ----------
-        project_id    : Google Cloud project ID.
-        index_path    : Folder containing the saved FAISS index.
-        chat_model    : LiteLLM model string for generating answers.
-        intent_model  : LiteLLM model string for intent classification
-                        (cheap/fast model is fine here).
-        memory_k      : Number of conversation turns to keep in memory.
-        metadata_json : Path to doc_metadata.json (needed for summary lookup).
-        """
-        os.environ["VERTEXAI_PROJECT"]  = project_id
+        os.environ["VERTEXAI_PROJECT"] = project_id
         os.environ["VERTEXAI_LOCATION"] = "us-central1"
 
         vertexai.init(project=project_id)
         self.chat_model = chat_model
         self.intent_model = intent_model
         self.memory_k = memory_k
-        self._history: list = []          # rolling list of {role, content} dicts
+        self._history: list = []
+        self._pending_manual: Optional[Dict] = None
 
-        # Load FAISS
         embeddings = GoogleGenerativeAIEmbeddings(
             model="models/text-embedding-004",
             project=project_id,
@@ -91,160 +134,337 @@ class GeminiRAGSystem:
             index_path, embeddings, allow_dangerous_deserialization=True
         )
 
-        # Load document titles from metadata for summary matching
-        self._doc_titles: List = []  
+        self._doc_catalog: List[Dict[str, str]] = []
         if os.path.exists(metadata_json):
             with open(metadata_json, "r", encoding="utf-8") as fh:
                 meta = json.load(fh)
             for v in meta.values():
-                title = v.get("title", "") 
+                title = v.get("title", "")
                 if title:
-                    self._doc_titles.append(title)
+                    self._doc_catalog.append(
+                        {
+                            "title": title,
+                            "source": v.get("source", "general"),
+                        }
+                    )
 
     # ------------------------------------------------------------------
-    # Intent detection
+    # LLM utilities
     # ------------------------------------------------------------------
+
+    def _json_completion(
+        self,
+        system: str,
+        query: str,
+        schema: dict,
+        max_tokens: int,
+        include_history: bool,
+    ) -> dict:
+        resp = litellm.completion(
+            model=self.intent_model,
+            messages=_build_messages(system, self._history, query, include_history=include_history),
+            temperature=0.0,
+            max_tokens=max_tokens,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "rag_structured_output",
+                    "strict": True,
+                    "schema": schema,
+                },
+            },
+        )
+        content = resp.choices[0].message.content.strip()
+        return json.loads(content)
+
+    def _rewrite_query(self, query: str) -> str:
+        if not self._history:
+            return query.strip()
+
+        schema = {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        }
+        try:
+            data = self._json_completion(
+                QUERY_REWRITE_SYSTEM,
+                query,
+                schema,
+                max_tokens=160,
+                include_history=True,
+            )
+            rewritten = data.get("query", "").strip()
+            return rewritten or query.strip()
+        except Exception as exc:
+            print(f"Query rewrite fallback: {exc}")
+            return query.strip()
 
     def _detect_intent(self, query: str) -> str:
-        """Returns 'SUMMARY', 'INFORMATION', 'MANUAL', LLM, or 'QA'."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "intent": {
+                    "type": "string",
+                    "enum": sorted(INTENTS),
+                }
+            },
+            "required": ["intent"],
+            "additionalProperties": False,
+        }
         try:
-            response_schema = {
-                "type": "object",
-                "properties": {
-                    "Categories": {
-                        "type": "string",
-                        "enum": ["SUMMARY", "QA", "MANUAL", "INFORMATION","LLM"],
-                        "description": "The classified intent category of the user query."
-                    }
-                },
-                "required": ["Categories"],
-                "additionalProperties": False
-            }
-            resp = litellm.completion(
-                model=self.intent_model,
-                messages=[
-                    {"role": "system", "content": INTENT_SYSTEM},
-                    {"role": "user", "content": query},
-                ],
-                temperature=0.0,
-                max_tokens=10,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "query_category", # Fixed typo in name
-                        "strict": True,
-                        "schema": response_schema
-                    }
-                },
+            data = self._json_completion(
+                INTENT_SYSTEM,
+                query,
+                schema,
+                max_tokens=32,
+                include_history=False,
             )
-            intent_str = resp.choices[0].message.content.strip()
-            
-            # 1. Try to parse as JSON first
-            try:
-                # Use json.loads() for strings
-                data = json.loads(intent_str)
-                # Check for variations in case just to be safe
-                cat = data.get("Categories") or data.get("categories") or data.get("CATEGORIES")
-                
-                if cat and cat.upper() in ["SUMMARY", "QA", "MANUAL", "INFORMATION"]:
-                    return cat.upper()
-            except json.JSONDecodeError:
-                # If JSON parsing fails, we'll gracefully fall down to the string-matching logic
-                pass 
-            
-            # 2. Fallback: robust string matching if JSON is malformed
-            intent_lower = intent_str.lower()
-            for word in ["SUMMARY", "QA", "MANUAL", "INFORMATION", "LLM"]:
-                if word.lower() in intent_lower:
-                    return word
-            
-            # 3. Ultimate safe default if nothing matches
-            print("###################")
-            print(f"Fallback triggered. Unmatched intent string: {intent_str}")
-            print("###################")
+            intent = str(
+                data.get("intent")
+                or data.get("Intent")
+                or data.get("Categories")
+                or data.get("categories")
+                or ""
+            ).upper()
+            return intent if intent in INTENTS else "QA"
+        except Exception as exc:
+            print(f"Intent detection fallback: {exc}")
             return "QA"
-            
-        except Exception as e:
-            print("###################")
-            print(f"Fatal error in intent detection: {e}")
-            print("###################")
-            return "QA"  # safe default
+
+    def _llm(self, system_prompt: str, query: str, include_history: bool = False) -> str:
+        resp = litellm.completion(
+            model=self.chat_model,
+            messages=_build_messages(system_prompt, self._history, query, include_history=include_history),
+            temperature=0.2,
+            max_tokens=2048,
+        )
+        return resp.choices[0].message.content.strip()
 
     # ------------------------------------------------------------------
-    # Source / keyword pre-processing (preserve original behaviour)
+    # Source / keyword pre-processing
     # ------------------------------------------------------------------
 
     @staticmethod
     def _parse_source_prefix(user_input: str) -> Tuple[str, str]:
-        """
-        Strip leading keyword (citazione / manuale) and return
-        (cleaned_query, source_filter).
-        """
         cleaned = user_input.strip()
         for kw in ("citazione", "manuale"):
             if cleaned.lower().startswith(kw):
                 return cleaned[len(kw):].strip(), kw
         return cleaned, "general"
 
+    @staticmethod
+    def _parse_confirmation(user_input: str) -> Optional[bool]:
+        value = user_input.strip().lower()
+        if value in YES_VALUES:
+            return True
+        if value in NO_VALUES:
+            return False
+        if any(value.startswith(prefix) for prefix in ("si ", "s\u00ec ", "yes ")):
+            return True
+        if any(value.startswith(prefix) for prefix in ("no ", "non ")):
+            return False
+        return None
+
+    @staticmethod
+    def _manual_confirmation_payload() -> str:
+        return (
+            "[Conferma richiesta: Manuale MFE]\n"
+            "Vuoi che la risposta sia estratta dal Manuale MFE? "
+            "Rispondi \"si\" per usare il manuale oppure \"no\" per usare la pipeline QA generale."
+        )
+
     # ------------------------------------------------------------------
     # Retrieval helpers
     # ------------------------------------------------------------------
 
-    def _qa_retrieval(self, query: str, source: str="general", k: int = 16) -> List[Document]:
+    def _qa_retrieval(self, query: str, source: str = "general", k: int = 16) -> List[Document]:
         kwargs: dict = {"k": k}
-        #if source != "general":
-        kwargs["filter"] = {"source": source}
-        return self.vector_db.similarity_search(query, **kwargs)
+        if source:
+            kwargs["filter"] = {"source": source}
+        return self.vector_db.similarity_search(_normalize_for_embedding(query), **kwargs)
 
-    def _summary_retrieval(self, query: str) -> Tuple[List[Document], str]:
-        """
-        Find the document whose title best matches the query, then return ALL
-        chunks for that document.
-        Returns (docs, matched_title).
-        """
-        if not self._doc_titles:
-            # Fall back to top-k if no metadata available
-            return self.vector_db.similarity_search(query, k=50), "unknown"
+    def _summary_retrieval(self, query: str) -> Tuple[List[Document], str, float]:
+        if not self._doc_catalog:
+            docs = self.vector_db.similarity_search(_normalize_for_embedding(query), k=50)
+            return docs, "unknown", 1.0 if docs else 0.0
 
-        # Score each known title against the query
-        best_title, best_source, best_score = "", "citazione", 0.0
-        for title in self._doc_titles:
-            score = _similarity(query, title)
+        best = {"title": "", "source": "citazione"}
+        best_score = 0.0
+        for item in self._doc_catalog:
+            score = _title_match_score(query, item["title"])
             if score > best_score:
-                best_score, best_title = score, title
+                best_score = score
+                best = item
 
-        # Fetch ALL chunks with that title (FAISS doesn't support "get all by
-        # filter" natively, so we use a large-k similarity search + filter)
+        if best_score < SUMMARY_MATCH_THRESHOLD:
+            return [], best["title"], best_score
+
         docs = self.vector_db.similarity_search(
-            best_title,
+            _normalize_for_embedding(best["title"]),
             k=500,
-            filter={"title": best_title, "source": best_source},
+            filter={"title": best["title"], "source": best.get("source", "citazione")},
         )
 
-        # De-duplicate by page_content
         seen: set = set()
         unique: List[Document] = []
         for doc in docs:
-            key = doc.page_content[:200]
+            key = (doc.metadata.get("title", ""), doc.metadata.get("chapter", ""), doc.page_content[:200])
             if key not in seen:
                 seen.add(key)
                 unique.append(doc)
 
-        return unique, best_title
+        return unique, best["title"], best_score
 
     # ------------------------------------------------------------------
-    # LLM call
+    # Source post-processing
     # ------------------------------------------------------------------
 
-    def _llm(self, system_prompt: str, query: str) -> str:
-        messages = _build_messages(system_prompt, self._history, query)
-        resp = litellm.completion(
-            model=self.chat_model,
-            messages=messages,
-            temperature=0.2,
-            max_tokens=2048,
+    @staticmethod
+    def _sources_from_docs(docs: List[Document], limit: int = 8) -> List[str]:
+        sources = []
+        for doc in docs:
+            m = doc.metadata
+            title = m.get("title", "").strip()
+            chapter = m.get("chapter", "").strip()
+            page_range = m.get("page_range", "").strip()
+            source_path = m.get("source_path", "").strip()
+            if title or chapter or page_range:
+                sources.append(" | ".join(part for part in (title, chapter, page_range) if part))
+            elif source_path:
+                sources.append(source_path)
+        return _dedupe(sources, limit=limit)
+
+    @staticmethod
+    def _extract_sources_from_answer(answer: str) -> Tuple[str, List[str]]:
+        lines = answer.splitlines()
+        body_lines: List[str] = []
+        source_lines: List[str] = []
+        in_sources = False
+        blank_after_sources = False
+
+        for line in lines:
+            if re.match(r"^\s*fonti\s*:", line, flags=re.IGNORECASE):
+                in_sources = True
+                blank_after_sources = False
+                tail = line.split(":", 1)[1].strip()
+                if tail:
+                    source_lines.append(tail)
+                continue
+            if in_sources:
+                stripped = line.strip()
+                if not stripped:
+                    blank_after_sources = True
+                    continue
+                likely_source = (
+                    re.match(r"^\s*[-*\[]", line) is not None
+                    or (stripped.count("|") >= 2 and "[" not in stripped)
+                )
+                if blank_after_sources and not likely_source:
+                    in_sources = False
+                    body_lines.append("")
+                    body_lines.append(line)
+                else:
+                    blank_after_sources = False
+                    source_lines.append(stripped)
+            else:
+                body_lines.append(line)
+
+        body = "\n".join(body_lines).strip()
+        sources: List[str] = []
+
+        source_text = "\n".join(source_lines)
+        sources.extend(re.findall(r"\[([^\[\]\n]*\|[^\[\]\n]*\|[^\[\]\n]*)\]", source_text))
+        if not sources and source_text.strip():
+            for line in source_lines:
+                cleaned = re.sub(r"^\s*[-*]\s*", "", line).strip(" []")
+                sources.extend(part.strip(" []") for part in cleaned.split(",") if part.strip())
+
+        inline_sources = re.findall(r"\[([^\[\]\n]*\|[^\[\]\n]*\|[^\[\]\n]*)\]", body)
+        sources.extend(inline_sources)
+        body = re.sub(r"\s*\[[^\[\]\n]*\|[^\[\]\n]*\|[^\[\]\n]*\]\s*", " ", body)
+        body = re.sub(r"[ \t]+([.,;:])", r"\1", body)
+        body = re.sub(r"\n{3,}", "\n\n", body).strip()
+        return body, _dedupe(sources)
+
+    def _postprocess_sources(self, answer: str, docs: List[Document]) -> str:
+        body, sources = self._extract_sources_from_answer(answer)
+        if not sources:
+            sources = self._sources_from_docs(docs)
+        if not sources:
+            sources = ["nessuna fonte pertinente"]
+        return f"{body or answer.strip()}\n\n[Fonti: {', '.join(sources)}]"
+
+    # ------------------------------------------------------------------
+    # Answer paths
+    # ------------------------------------------------------------------
+
+    def _answer_summary(self, query: str, k: int) -> str:
+        docs, matched_title, score = self._summary_retrieval(query)
+        if score < SUMMARY_MATCH_THRESHOLD or not docs:
+            print(
+                f"SUMMARY fallback to QA: matched_title={matched_title!r}, score={score:.3f}, docs={len(docs)}"
+            )
+            return self._answer_qa(query, source="general", k=k)
+
+        context = _format_context(docs)
+        system = SUMMARY_SYSTEM.format(context=context)
+        answer = self._llm(system, f"Riassumi il documento: {matched_title}", include_history=False)
+        return self._postprocess_sources(answer, docs)
+
+    def _answer_information(self, query: str, k: int) -> str:
+        docs = self._qa_retrieval(query, source="citazione", k=k)
+        if not docs:
+            return NO_SOURCE_ANSWER
+        context = _format_context(docs)
+        system = QA_CITATION_SYSTEM.format(context=context)
+        answer = self._llm(system, query, include_history=False)
+        return self._postprocess_sources(answer, docs)
+
+    def _answer_manual(self, query: str) -> str:
+        docs = self._qa_retrieval(query, source="manuale", k=100)
+        if not docs:
+            return NO_SOURCE_ANSWER
+        context = _format_context(docs)
+        system = MANUAL_SYSTEM.format(context=context)
+        answer = self._llm(system, query, include_history=False)
+        return self._postprocess_sources(answer, docs)
+
+    def _answer_qa(self, query: str, source: str, k: int) -> str:
+        answer_parts: List[str] = []
+        used_docs: List[Document] = []
+
+        primary_docs = self._qa_retrieval(query, source=source, k=k)
+        if primary_docs:
+            context = _format_context(primary_docs)
+            system = QA_SYSTEM.format(context=context)
+            answer_parts.append(self._llm(system, query, include_history=False))
+            used_docs.extend(primary_docs)
+
+        if source != "citazione":
+            citation_docs = self._qa_retrieval(query, source="citazione", k=k)
+            if citation_docs:
+                context = _format_context(citation_docs)
+                system = QA_CITATION_SYSTEM.format(context=context)
+                answer_parts.append(self._llm(system, query, include_history=False))
+                used_docs.extend(citation_docs)
+
+        if not answer_parts:
+            return NO_SOURCE_ANSWER
+
+        answer = "\n\n".join(answer_parts)
+        return self._postprocess_sources(answer, used_docs)
+
+    def _answer_direct_llm(self, query: str) -> str:
+        try:
+            raw_answer = self._llm(DIRECT_LLM_SYSTEM, query, include_history=True)
+        except Exception as exc:
+            raw_answer = f"Errore durante la generazione della risposta: {exc}"
+        return (
+            f"{raw_answer}\n\n"
+            "Nota: la risposta e stata generata direttamente dal LLM senza consultare la base documentale."
         )
-        return resp.choices[0].message.content.strip()
 
     # ------------------------------------------------------------------
     # Memory
@@ -253,110 +473,59 @@ class GeminiRAGSystem:
     def _update_memory(self, query: str, answer: str) -> None:
         self._history.append({"role": "user", "content": query})
         self._history.append({"role": "assistant", "content": answer})
-        # Keep only last k exchanges (2 messages per exchange)
         max_msgs = self.memory_k * 2
         if len(self._history) > max_msgs:
             self._history = self._history[-max_msgs:]
+
+    def reset(self) -> None:
+        self._history = []
+        self._pending_manual = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def ask(self, user_query: str, k: int = 16) -> str:
-        """
-        Process a user query end-to-end:
-        1. Parse optional source prefix (citazione / manuale).
-        2. Detect intent: SUMMARY or QA.
-        3. Retrieve relevant chunks accordingly.
-        4. Generate and return the Italian-language answer.
-        """
+    def ask(self, user_query: str, k: int = 16, manual_confirmed: Optional[bool] = None) -> str:
+        if not user_query or not user_query.strip():
+            return ""
+
+        if self._pending_manual is not None:
+            confirmed = manual_confirmed
+            if confirmed is None:
+                confirmed = self._parse_confirmation(user_query)
+            if confirmed is None:
+                return self._manual_confirmation_payload()
+
+            pending = self._pending_manual
+            self._pending_manual = None
+            if confirmed:
+                answer = self._answer_manual(pending["search_query"])
+            else:
+                answer = self._answer_qa(pending["search_query"], source="general", k=pending["k"])
+            self._update_memory(pending["query"], answer)
+            return answer
+
         query, source = self._parse_source_prefix(user_query)
-        intent = self._detect_intent(query)
+        search_query = self._rewrite_query(query)
+        intent = self._detect_intent(search_query)
+
+        if intent == "MANUAL":
+            self._pending_manual = {
+                "query": query,
+                "search_query": search_query,
+                "source": source,
+                "k": k,
+            }
+            return self._manual_confirmation_payload()
 
         if intent == "SUMMARY":
-            docs, matched_title = self._summary_retrieval(query)
-
-            if not docs:
-                answer = (
-                    "Non ho trovato un documento corrispondente al titolo indicato."
-                )
-            else:
-                context = _format_context(docs)
-                system = SUMMARY_SYSTEM.format(context=context)
-                answer = self._llm(system, f"Riassumi il documento: {matched_title}")
-        elif intent == "INFORMATION": 
-            docs = self._qa_retrieval(query, source = "citazione", k=k)
-            if not docs:
-                return (
-                    "Le risorse attualmente disponibili non forniscono una risposta "
-                    "definitiva alla Sua domanda."
-                )
-            context = _format_context(docs)
-            template = QA_CITATION_SYSTEM #if source == "citazione" else QA_SYSTEM
-            system = template.format(context=context)
-            answer = self._llm(system, query)
-        elif intent == "MANUAL": 
-            docs = self._qa_retrieval(query, source = "manuale", k=100)
-            if not docs:
-                return (
-                    "Le risorse attualmente disponibili non forniscono una risposta "
-                    "definitiva alla Sua domanda."
-                )
-            context = _format_context(docs)
-            print(context)
-            template = MANUAL_SYSTEM #if source == "citazione" else QA_SYSTEM
-            system = template.format(context=context)
-            answer = self._llm(system, query)
+            answer = self._answer_summary(search_query, k=k)
+        elif intent == "INFORMATION":
+            answer = self._answer_information(search_query, k=k)
         elif intent == "LLM":
-            # ── Direct LLM answer (no retrieval) ──────────────────────────
-            try:
-                resp = litellm.completion(
-                    model=self.chat_model,
-                    messages=_build_messages(
-                        "Sei un assistente esperto. Rispondi in modo chiaro e preciso. "
-                        "Alla fine della risposta, cita sempre le fonti utilizzate "
-                        "(modello, data di addestramento o conoscenza generale).",
-                        self._history,
-                        query,
-                    ),
-                    temperature=0.0,
-                    max_tokens=2048,
-                )
-                raw_answer = resp.choices[0].message.content.strip()
-            except Exception as e:
-                raw_answer = f"Errore durante la generazione della risposta: {e}"
+            answer = self._answer_direct_llm(search_query)
+        else:
+            answer = self._answer_qa(search_query, source=source, k=k)
 
-            answer = (
-                f"{raw_answer}\n\n"
-                "---\n"
-                "⚠️ *Nota: la risposta è stata generata direttamente dal LLM "
-                "senza consultare la base documentale.*"
-            )
-
-        else:  # QA
-            # from the dispensa
-            docs = self._qa_retrieval(query, source, k=k)
-            if not docs:
-                return (
-                    "Le risorse attualmente disponibili non forniscono una risposta "
-                    "definitiva alla Sua domanda."
-                )
-            context = _format_context(docs)
-            template = QA_SYSTEM #QA_CITATION_SYSTEM if source == "citazione" else QA_SYSTEM
-            system = template.format(context=context)
-            answer_1 = self._llm(system, query)
-            # from citation
-            docs = self._qa_retrieval(query, source = "citazione", k=k)
-            if not docs:
-                answer_2 = None
-            else:
-                context = _format_context(docs)
-                template = QA_CITATION_SYSTEM #if source == "citazione" else QA_SYSTEM
-                system = template.format(context=context)
-                answer_2 = self._llm(system, query)
-            if answer_2 == None:
-                answer = answer_1
-            else:
-                answer = answer_1 + "\n" + answer_2
         self._update_memory(query, answer)
         return answer

@@ -212,9 +212,10 @@ class VectorDBBuilder:
                 text = "\n\n".join(p.page_content for p in chapter_pages)
 
                 for chunk in splitter.split_text(text):
+                    normalized_chunk = chunk.lower()
                     chunks.append(
                         Document(
-                            page_content=chunk,
+                            page_content=normalized_chunk,
                             metadata={
                                 "title": structure.get("title", ""),
                                 "source": structure.get("source", "general"),

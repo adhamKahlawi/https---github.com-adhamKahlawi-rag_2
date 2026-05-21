@@ -25,6 +25,11 @@ def chat_engine(user_input: str, history: list):
     return "", history
 
 
+def clear_chat():
+    rag.reset()
+    return "", []
+
+
 # ── UI ─────────────────────────────────────────────────────────────────────────
 with gr.Blocks(title="RAG Assistant") as demo:
     gr.Markdown(
@@ -50,7 +55,7 @@ with gr.Blocks(title="RAG Assistant") as demo:
 
     msg.submit(chat_engine, [msg, chatbot], [msg, chatbot])
     submit_btn.click(chat_engine, [msg, chatbot], [msg, chatbot])
-    clear_btn.click(lambda: ([], []), None, [chatbot], queue=False)
+    clear_btn.click(clear_chat, None, [msg, chatbot], queue=False)
 
 if __name__ == "__main__":
     demo.launch()
