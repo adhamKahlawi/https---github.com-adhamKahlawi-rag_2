@@ -24,12 +24,11 @@ from src.prompts import (
     QUERY_REWRITE_SYSTEM,
     SUMMARY_SYSTEM,
 )
+from src.core.citations import format_academic_response
 
 
 INTENTS = {"SUMMARY", "QA", "MANUAL", "INFORMATION", "LLM"}
 SUMMARY_MATCH_THRESHOLD = 0.45
-YES_VALUES = {"si", "s\u00ec", "yes", "y", "ok", "certo", "confermo"}
-NO_VALUES = {"no", "n", "nope", "annulla", "non usare", "senza manuale"}
 NO_SOURCE_ANSWER = (
     "Le risorse attualmente disponibili non forniscono una risposta definitiva alla Sua domanda.\n\n"
     "[Fonti: nessuna fonte pertinente]"
@@ -109,8 +108,8 @@ class GeminiRAGSystem:
         self,
         project_id: str,
         index_path: str = "vector_database",
-        chat_model: str = "vertex_ai/gemini-2.0-flash",
-        intent_model: str = "vertex_ai/gemini-2.0-flash",
+        chat_model: str = "vertex_ai/gemini-2.5-flash",
+        intent_model: str = "vertex_ai/gemini-2.5-flash",
         memory_k: int = 10,
         metadata_json: str = "vector_database/doc_metadata.json",
     ):
@@ -122,7 +121,6 @@ class GeminiRAGSystem:
         self.intent_model = intent_model
         self.memory_k = memory_k
         self._history: list = []
-        self._pending_manual: Optional[Dict] = None
 
         embeddings = GoogleGenerativeAIEmbeddings(
             model="models/text-embedding-004",
@@ -254,27 +252,6 @@ class GeminiRAGSystem:
                 return cleaned[len(kw):].strip(), kw
         return cleaned, "general"
 
-    @staticmethod
-    def _parse_confirmation(user_input: str) -> Optional[bool]:
-        value = user_input.strip().lower()
-        if value in YES_VALUES:
-            return True
-        if value in NO_VALUES:
-            return False
-        if any(value.startswith(prefix) for prefix in ("si ", "s\u00ec ", "yes ")):
-            return True
-        if any(value.startswith(prefix) for prefix in ("no ", "non ")):
-            return False
-        return None
-
-    @staticmethod
-    def _manual_confirmation_payload() -> str:
-        return (
-            "[Conferma richiesta: Manuale MFE]\n"
-            "Vuoi che la risposta sia estratta dal Manuale MFE? "
-            "Rispondi \"si\" per usare il manuale oppure \"no\" per usare la pipeline QA generale."
-        )
-
     # ------------------------------------------------------------------
     # Retrieval helpers
     # ------------------------------------------------------------------
@@ -393,8 +370,12 @@ class GeminiRAGSystem:
         if not sources:
             sources = self._sources_from_docs(docs)
         if not sources:
-            sources = ["nessuna fonte pertinente"]
-        return f"{body or answer.strip()}\n\n[Fonti: {', '.join(sources)}]"
+            return body or answer.strip()
+        # Citation numbering is deterministic and owned by the application.
+        # The compact marker at the end of the prose keeps legacy model output
+        # valid while the References block provides the full source details.
+        markers = " ".join(f"[{i}]" for i in range(1, len(sources) + 1))
+        return format_academic_response(f"{body or answer.strip()} {markers}", sources)
 
     # ------------------------------------------------------------------
     # Answer paths
@@ -479,7 +460,6 @@ class GeminiRAGSystem:
 
     def reset(self) -> None:
         self._history = []
-        self._pending_manual = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -489,34 +469,12 @@ class GeminiRAGSystem:
         if not user_query or not user_query.strip():
             return ""
 
-        if self._pending_manual is not None:
-            confirmed = manual_confirmed
-            if confirmed is None:
-                confirmed = self._parse_confirmation(user_query)
-            if confirmed is None:
-                return self._manual_confirmation_payload()
-
-            pending = self._pending_manual
-            self._pending_manual = None
-            if confirmed:
-                answer = self._answer_manual(pending["search_query"])
-            else:
-                answer = self._answer_qa(pending["search_query"], source="general", k=pending["k"])
-            self._update_memory(pending["query"], answer)
-            return answer
-
         query, source = self._parse_source_prefix(user_query)
         search_query = self._rewrite_query(query)
         intent = self._detect_intent(search_query)
 
         if intent == "MANUAL":
-            self._pending_manual = {
-                "query": query,
-                "search_query": search_query,
-                "source": source,
-                "k": k,
-            }
-            return self._manual_confirmation_payload()
+            answer = self._answer_manual(search_query)
 
         if intent == "SUMMARY":
             answer = self._answer_summary(search_query, k=k)

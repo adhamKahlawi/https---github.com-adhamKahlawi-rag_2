@@ -1,8 +1,9 @@
 """main_chat_bot.py – CLI chat loop."""
-from src.chat_llm import GeminiRAGSystem
+from src.rag_orchestrator import RAGCoordinator
 
 if __name__ == "__main__":
-    rag = GeminiRAGSystem(
+    rag = RAGCoordinator(
+        session_id="cli-default",
         project_id="august-balancer-460307-q0",
         index_path="vector_database",
         metadata_json="vector_database/doc_metadata.json",

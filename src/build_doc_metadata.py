@@ -12,6 +12,8 @@ from typing import Dict, List, Tuple, Optional
 import litellm
 import pdfplumber
 from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader
+from src.core.state import YAMLIngestionState
+from src.core.schemas import IngestionRecord
 
 
 CATEGORIES = ["general", "citazione", "manuale"]
@@ -308,13 +310,14 @@ class MetadataGenerator:
               f"chapters={len(result['chapters'])}")
         return result
 
-    def generate_metadata(self, root_path: str, output_json: str) -> None:
+    def generate_metadata(self, root_path: str, output_json: str, state_path: str = "vector_database/ingestion_state.yaml") -> None:
         """
         Walk every category sub-folder in root_path, analyse new files,
         and save results to output_json. Already-cached files are skipped.
         Progress is saved after every file so crashes don't lose work.
         """
         metadata: Dict = {}
+        state = YAMLIngestionState(state_path)
         if os.path.exists(output_json):
             try:
                 with open(output_json, "r", encoding="utf-8") as fh:
@@ -336,12 +339,19 @@ class MetadataGenerator:
                 continue
             for filename in os.listdir(folder):
                 file_path = os.path.join(folder, filename)
-                if file_path in metadata:
+                if not state.needs_processing(file_path):
                     print(f"Skip (cached): {filename}")
                     continue
                 print(f"\nAnalysing [{category}]: {filename}")
                 result = self._analyse(file_path)
                 metadata[file_path] = {**result, "source": category}
                 _save()
+                state.mark(IngestionRecord(
+                    document_id=state.fingerprint(file_path), title=result.get("title", filename),
+                    source_path=file_path, category=category,
+                    content_hash=state.fingerprint(file_path),
+                    status="metadata_ready" if result.get("chapters") else "failed",
+                    error="metadata extraction failed" if not result.get("chapters") else "",
+                ))
 
         print(f"\nMetadata saved to {output_json} ({len(metadata)} documents)")

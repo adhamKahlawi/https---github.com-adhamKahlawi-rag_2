@@ -3,10 +3,11 @@ main.py  –  Gradio front-end for the Gemini RAG Assistant.
 """
 
 import gradio as gr
-from src.chat_llm import GeminiRAGSystem
+from src.rag_orchestrator import RAGCoordinator
 
 # ── Initialise once ────────────────────────────────────────────────────────────
-rag = GeminiRAGSystem(
+rag = RAGCoordinator(
+    session_id="gradio-default",
     project_id="august-balancer-460307-q0",
     index_path="vector_database",
     metadata_json="vector_database/doc_metadata.json",
