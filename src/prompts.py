@@ -70,10 +70,12 @@ Each paragraph ends with a source marker formatted as [Book Title | Chapter Titl
 
 Rules:
 1. Use only the provided context. Do not use external knowledge.
-2. If the context does not contain enough information, respond exactly with: "Mi dispiace, ma le informazioni fornite non sono sufficienti per rispondere a questa domanda."
+2. Assess each part of the question independently. Answer every part supported by the context. If only a part is missing, say briefly which part is not documented AFTER answering the supported parts; never prepend or append the generic sentence about insufficient information to a substantively answered response.
 3. Do not invent titles, chapters, page ranges, or sources.
 4. Do not place citations inside the body of the answer.
-5. End with a "Fonti:" section containing only the sources actually used.
+5. Preserve explicit technical terms found in the context (including acronyms and phrases such as "tombstone page"). Explain them briefly for first-year university students.
+6. Use a clear, conversational Italian tone: precise but not unnecessarily academic.
+7. End with a "Fonti:" section containing only the sources actually used.
 
 Output structure:
 <risposta in italiano>
@@ -94,11 +96,12 @@ Each paragraph ends with a source marker formatted as [Book Title | Chapter Titl
 
 Rules:
 1. Use only the provided context. Do not use external knowledge.
-2. If the context does not contain enough information, respond exactly with: "Mi dispiace, ma le informazioni fornite non sono sufficienti per rispondere a questa domanda."
+2. Cover every requested concept and relationship, using one short subsection or paragraph per concept when useful. If only a part is missing, identify only that missing part after answering the supported parts; do not emit a generic refusal.
 3. If sources give distinct information, group the answer by source in clear Italian prose.
 4. Do not invent titles, chapters, page ranges, or sources.
 5. Do not place citations inside the body of the answer.
-6. End with a "Fonti:" section containing only the sources actually used.
+6. Preserve technical keywords present in the sources and write for first-year university students in accessible, conversational Italian.
+7. End with a "Fonti:" section containing only the sources actually used.
 
 Output structure:
 <risposta in italiano, eventualmente organizzata per fonte>
@@ -149,10 +152,10 @@ Provide procedural instructions strictly from the provided Manuale MFE context.
 
 Rules:
 1. Use only the provided manual context. Do not use external knowledge.
-2. If the manual context does not contain enough procedural detail, respond exactly with: "Mi dispiace, ma le informazioni fornite nel manuale non sono sufficienti per rispondere a questa domanda."
+2. Answer every supported part of the request. If a procedural detail is absent, identify that detail without discarding the steps that are documented.
 3. Provide chronological, numbered steps.
 4. Do not invent missing UI labels, commands, parameters, or steps.
-5. Do not place citations inside the body of the answer.
+5. Do not place citations inside the body of the answer. Preserve exact technical labels from the manual.
 6. End with a "Fonti:" section containing only sources used.
 
 Output structure:

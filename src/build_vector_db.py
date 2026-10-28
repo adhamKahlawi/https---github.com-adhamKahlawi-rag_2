@@ -194,7 +194,6 @@ class VectorDBBuilder:
         chunks: List[Document] = []
 
         for file_path, structure in metadata.items():
-            print("kahlawi")
             pages = self._load_pages(file_path)
             if not pages:
                 continue

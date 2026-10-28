@@ -217,13 +217,13 @@ class MetadataGenerator:
     def __init__(
         self,
         project_id: str,
-        model: str    = "vertex_ai/gemini-2.0-flash-001",
-        location: str = "us-central1",
+        model: str    = "vertex_ai/gemini-2.5-flash",
+        #location: str = "us-central1",
     ):
         self.project_id = project_id
         self.model      = model
         os.environ["VERTEXAI_PROJECT"]  = project_id
-        os.environ["VERTEXAI_LOCATION"] = location
+        #os.environ["VERTEXAI_LOCATION"] = location
 
     @staticmethod
     def _ext(path: str) -> str:

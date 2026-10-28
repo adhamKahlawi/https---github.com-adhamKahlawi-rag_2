@@ -71,8 +71,13 @@ def _title_match_score(query: str, title: str) -> float:
 
 def _format_context(docs: List[Document]) -> str:
     parts = []
+    seen = set()
     for doc in docs:
         m = doc.metadata
+        key = (m.get("title", ""), m.get("chapter", ""), m.get("page_range", ""), doc.page_content[:300])
+        if key in seen:
+            continue
+        seen.add(key)
         citation = f"[{m.get('title', '')} | {m.get('chapter', '')} | {m.get('page_range', '')}]"
         parts.append(f"{doc.page_content} {citation}.")
     return "\n---\n".join(parts)
@@ -108,8 +113,11 @@ class GeminiRAGSystem:
         self,
         project_id: str,
         index_path: str = "vector_database",
-        chat_model: str = "vertex_ai/gemini-2.5-flash",
-        intent_model: str = "vertex_ai/gemini-2.5-flash",
+        # Vertex AI model IDs must use the API slug, not the display name.
+        # In particular, a display name such as ``Gemini 3.5 Flash-Lite`` is
+        # interpreted by LiteLLM as a custom Vertex endpoint name.
+        chat_model: Optional[str] = None,
+        intent_model: Optional[str] = None,
         memory_k: int = 10,
         metadata_json: str = "vector_database/doc_metadata.json",
     ):
@@ -117,8 +125,9 @@ class GeminiRAGSystem:
         os.environ["VERTEXAI_LOCATION"] = "us-central1"
 
         vertexai.init(project=project_id)
-        self.chat_model = chat_model
-        self.intent_model = intent_model
+        default_model = os.getenv("VERTEX_CHAT_MODEL", "vertex_ai/gemini-2.5-flash-lite")
+        self.chat_model = chat_model or default_model
+        self.intent_model = intent_model or os.getenv("VERTEX_INTENT_MODEL", self.chat_model)
         self.memory_k = memory_k
         self._history: list = []
 
@@ -257,10 +266,46 @@ class GeminiRAGSystem:
     # ------------------------------------------------------------------
 
     def _qa_retrieval(self, query: str, source: str = "general", k: int = 16) -> List[Document]:
-        kwargs: dict = {"k": k}
-        if source:
-            kwargs["filter"] = {"source": source}
-        return self.vector_db.similarity_search(_normalize_for_embedding(query), **kwargs)
+        # Query the vector index with small, independent facets. This avoids a
+        # single embedding dominating multi-concept questions (e.g. accessibilita
+        # AND riusabilita) and avoids expensive graph-style traversals.
+        facets = [query]
+        terms = re.split(r"\s+(?:e|ed|and|oppure|o|sia|che|con|vs\.?|versus)\s+|[,;?]", query, flags=re.I)
+        facets.extend(part.strip() for part in terms if len(part.strip().split()) >= 2)
+        results: List[Document] = []
+        seen = set()
+        per_facet = max(4, min(10, k // max(1, len(facets))))
+        for facet in facets[:6]:
+            kwargs: dict = {"k": per_facet}
+            if source and source != "general":
+                kwargs["filter"] = {"source": source}
+            try:
+                found = self.vector_db.similarity_search(_normalize_for_embedding(facet), **kwargs)
+            except Exception as exc:
+                print(f"Retrieval facet fallback ({facet!r}): {exc}")
+                found = []
+            for doc in found:
+                m = doc.metadata
+                key = (m.get("title", ""), m.get("chapter", ""), m.get("page_range", ""), doc.page_content[:300])
+                if key not in seen:
+                    seen.add(key)
+                    results.append(doc)
+        return results[: max(k, 1)]
+
+    def _retrieve_all_sources(self, query: str, k: int) -> List[Document]:
+        """Retrieve both course material and bibliography, then interleave them."""
+        docs = self._qa_retrieval(query, source="general", k=k)
+        for source in ("citazione", "manuale"):
+            docs.extend(self._qa_retrieval(query, source=source, k=max(4, k // 2)))
+        unique = []
+        seen = set()
+        for doc in docs:
+            m = doc.metadata
+            key = (m.get("title", ""), m.get("chapter", ""), m.get("page_range", ""), doc.page_content[:300])
+            if key not in seen:
+                seen.add(key)
+                unique.append(doc)
+        return unique[: max(k * 2, 1)]
 
     def _summary_retrieval(self, query: str) -> Tuple[List[Document], str, float]:
         if not self._doc_catalog:
@@ -395,7 +440,7 @@ class GeminiRAGSystem:
         return self._postprocess_sources(answer, docs)
 
     def _answer_information(self, query: str, k: int) -> str:
-        docs = self._qa_retrieval(query, source="citazione", k=k)
+        docs = self._retrieve_all_sources(query, k)
         if not docs:
             return NO_SOURCE_ANSWER
         context = _format_context(docs)
@@ -416,14 +461,14 @@ class GeminiRAGSystem:
         answer_parts: List[str] = []
         used_docs: List[Document] = []
 
-        primary_docs = self._qa_retrieval(query, source=source, k=k)
+        primary_docs = self._retrieve_all_sources(query, k) if source == "general" else self._qa_retrieval(query, source=source, k=k)
         if primary_docs:
             context = _format_context(primary_docs)
             system = QA_SYSTEM.format(context=context)
             answer_parts.append(self._llm(system, query, include_history=False))
             used_docs.extend(primary_docs)
 
-        if source != "citazione":
+        if source not in ("citazione", "general"):
             citation_docs = self._qa_retrieval(query, source="citazione", k=k)
             if citation_docs:
                 context = _format_context(citation_docs)
@@ -475,8 +520,7 @@ class GeminiRAGSystem:
 
         if intent == "MANUAL":
             answer = self._answer_manual(search_query)
-
-        if intent == "SUMMARY":
+        elif intent == "SUMMARY":
             answer = self._answer_summary(search_query, k=k)
         elif intent == "INFORMATION":
             answer = self._answer_information(search_query, k=k)
