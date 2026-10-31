@@ -29,6 +29,10 @@ from src.core.citations import format_academic_response
 
 INTENTS = {"SUMMARY", "QA", "MANUAL", "INFORMATION", "LLM"}
 SUMMARY_MATCH_THRESHOLD = 0.45
+# Relevance scores returned by FAISS are distance-normalized by LangChain.
+# Low-scoring neighbours are useful for retrieval diagnostics, but must not
+# become citation candidates.
+CITATION_RELEVANCE_THRESHOLD = 0.35
 NO_SOURCE_ANSWER = (
     "Le risorse attualmente disponibili non forniscono una risposta definitiva alla Sua domanda.\n\n"
     "[Fonti: nessuna fonte pertinente]"
@@ -280,10 +284,25 @@ class GeminiRAGSystem:
             if source and source != "general":
                 kwargs["filter"] = {"source": source}
             try:
-                found = self.vector_db.similarity_search(_normalize_for_embedding(facet), **kwargs)
+                scored = self.vector_db.similarity_search_with_relevance_scores(
+                    _normalize_for_embedding(facet), **kwargs
+                )
+                found = [
+                    doc for doc, relevance in scored
+                    if relevance >= CITATION_RELEVANCE_THRESHOLD
+                ]
             except Exception as exc:
-                print(f"Retrieval facet fallback ({facet!r}): {exc}")
-                found = []
+                # Keep compatibility with vector-store implementations that
+                # expose only similarity_search; citation post-processing still
+                # prevents citations on explicit no-context answers.
+                print(f"Scored retrieval fallback ({facet!r}): {exc}")
+                try:
+                    found = self.vector_db.similarity_search(
+                        _normalize_for_embedding(facet), **kwargs
+                    )
+                except Exception as inner_exc:
+                    print(f"Retrieval facet fallback ({facet!r}): {inner_exc}")
+                    found = []
             for doc in found:
                 m = doc.metadata
                 key = (m.get("title", ""), m.get("chapter", ""), m.get("page_range", ""), doc.page_content[:300])
@@ -412,6 +431,11 @@ class GeminiRAGSystem:
 
     def _postprocess_sources(self, answer: str, docs: List[Document]) -> str:
         body, sources = self._extract_sources_from_answer(answer)
+        # A refusal is an answer about the absence of evidence, not an answer
+        # supported by every document returned by a broad vector search.
+        # Remove both model-supplied and application-generated citations.
+        if self._is_no_context_answer(body):
+            return body or answer.strip()
         if not sources:
             sources = self._sources_from_docs(docs)
         if not sources:
@@ -421,6 +445,24 @@ class GeminiRAGSystem:
         # valid while the References block provides the full source details.
         markers = " ".join(f"[{i}]" for i in range(1, len(sources) + 1))
         return format_academic_response(f"{body or answer.strip()} {markers}", sources)
+
+    @staticmethod
+    def _is_no_context_answer(text: str) -> bool:
+        """Return true for a refusal that must never receive citations."""
+        normalized = re.sub(r"\s+", " ", text or "").strip().lower()
+        if not normalized:
+            return False
+        refusal_patterns = (
+            r"non ci sono informazioni.*(contesto|document|fornit)",
+            r"non (?:ho|abbiamo) informazioni.*(contesto|document|fornit)",
+            r"informazioni insufficienti.*(contesto|document)",
+            r"non è possibile rispondere.*(contesto|document)",
+            r"non posso rispondere.*(contesto|document)",
+            r"not enough information.*(context|document)",
+            r"not (?:available|contained) in the (?:provided )?context",
+            r"cannot answer.*(context|document)",
+        )
+        return any(re.search(pattern, normalized) for pattern in refusal_patterns)
 
     # ------------------------------------------------------------------
     # Answer paths
